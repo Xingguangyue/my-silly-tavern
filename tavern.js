@@ -173,3 +173,137 @@ function batchExcludeOlder(keep) {
 
 
 
+// 4. 上下文 ==========================================================================
+
+
+// 判断是否参与上下文
+function isInContext(m) {
+  if (m.excluded) return false;   // 用户显式排除
+  if (!m.complete) return false;  // 未完成的默认不进上下文
+  return true;
+}
+
+// 未发送原因的枚举 —— 题目要求预览能回答「某条内容为什么没有发送」
+const REASON_TEXT = {
+  excluded:   '已被设为「不发送」',
+  incomplete: '生成未完成',
+  empty:      '内容为空'
+};
+
+/**
+ * 构造这次请求要发的内容，同时生成一份「请求快照」。
+ * 快照是发出去那一刻的事实，之后改历史消息也不会改写它。
+ */
+function buildRequest(sid, extraText) {
+  const list = msgs(sid);
+  const sent = [];      // 会被发送的消息
+  const notSent = [];   // 不会被发送的消息 + 原因
+
+  for (const m of list) {
+    if (m.excluded)   { notSent.push({ id: m.id, role: m.role, reason: 'excluded' });   continue; }
+    if (!m.complete)  { notSent.push({ id: m.id, role: m.role, reason: 'incomplete' }); continue; }
+    if (!m.content)   { notSent.push({ id: m.id, role: m.role, reason: 'empty' });      continue; }
+    sent.push({ id: m.id, role: m.role, content: m.content, hidden: !!m.hidden });
+  }
+
+  // 世界书候选（详见第 5 节）
+  const hits = matchWorldbook(sid, extraText);
+
+  // ⚠️ 注意看顺序：世界书在前（作为 system），历史消息在后
+  const finalMessages = [];
+  for (const h of hits) {
+    finalMessages.push({ role: 'system', content: '【' + h.entry.name + '】\n' + h.entry.content });
+  }
+  for (const s of sent) {
+    finalMessages.push({ role: s.role, content: s.content });
+  }
+
+  // 「按发送顺序」的来源清单，给预览面板用
+  const parts = [];
+  for (const h of hits) {
+    parts.push({
+      kind: 'worldbook',
+      label: '世界书：' + h.entry.name,
+      which: h.keyword ? ('命中关键词「' + h.keyword + '」') : '常驻条目，直接入选',
+      content: h.entry.content
+    });
+  }
+  for (const s of sent) {
+    parts.push({
+      kind: 'message',
+      label: (s.role === 'user' ? '用户消息' : 'AI 消息') + ' · ' + s.id.slice(-6),
+      which: s.hidden ? '已发送（界面已隐藏，但 AI 仍能读到）' : '已发送',
+      content: s.content
+    });
+  }
+
+  const used = estimateTokens(finalMessages);
+  const snapshot = {
+    sessionId: sid,
+    createdAt: Date.now(),
+    parts: parts,
+    notSent: notSent,
+    mode: parts.length ? '正常发送' : '无内容可发',
+    usage: used,
+    limit: DB.config.ctxLimit,
+    depth: DB.config.depth
+  };
+
+  return { finalMessages, snapshot };
+}
+
+// 5. 世界书匹配=========================================================
+
+function matchWorldbook(sid, extraText) {
+  const depth = Math.max(0, Number(DB.config.depth) || 0); //防止depth为0
+
+  // 规则 1：扫描范围 = 最近 N 条符合条件的消息+本次待发送的消息
+  let scanPool = msgs(sid).filter(isInContext); //扫描时只考虑上下文中的
+  scanPool = scanPool.slice(-depth);
+  if (extraText) { //本次待发送的消息
+    scanPool = scanPool.concat([{ id: '__pending__', content: extraText }]);
+  }
+
+  const hits = [];//命中的条目
+  const usedIds = new Set();  // 储存命中过的条目，避免重复加入hits。规则 5：同一个条目最多插入一次
+
+  for (const e of DB.worldbook.entries) { // 遍历世界数中的元素
+
+    // 规则 3：禁用的条目 始终排除
+    if (!e.enabled) continue;
+
+    // 规则 3：常驻的条目 直接加入到hits中，不需要关键词触发
+    if (e.constant) {
+      if (!usedIds.has(e.id)) {
+        usedIds.add(e.id);
+        hits.push({ entry: e, keyword: null, fromId: null });
+      }
+      continue;
+    }
+
+    // 规则 2：在单条消息正文内进行关键词包含匹配；任意关键词命中即可成为候选，不跨消息拼接匹配。
+    let found = null;
+    for (const m of scanPool) { // 在扫描池中再进行遍历，找包含世界树元素的语句
+      const kw = (e.keywords || []).find(k => k && m.content.includes(k));
+      if (kw) { found = { keyword: kw, fromId: m.id }; break; }
+    }
+
+    // 规则 4：不递归扫描世界书正文，也不扫描角色设定和提示词模块。
+    //         ↑ 上面只碰了 m.content（消息正文），从没碰过 e.content，这就是规则 4。
+
+    if (found && !usedIds.has(e.id)) { //如果找到关键词而且没被命中过
+      usedIds.add(e.id);
+      hits.push({ entry: e, keyword: found.keyword, fromId: found.fromId });
+    }
+  }
+
+  // 规则 5：候选按优先级从高到低处理；优先级相同时按 ASCII ID 升序
+  hits.sort((a, b) => {
+    if (b.entry.priority !== a.entry.priority) return b.entry.priority - a.entry.priority;
+    if (a.entry.id < b.entry.id) return -1;   // 条目 ID 用 wb_001 这种零填充形式，
+    if (a.entry.id > b.entry.id) return 1;    // 这样字符串比较就等于 ASCII 升序
+    return 0;
+  });
+
+  return hits;
+}
