@@ -77,15 +77,18 @@
 
     <!-- ---------- 预览 ---------- -->
     <section class="tab-pane is-active" data-pane="preview" aria-label="请求预览">
-      <h3>这次实际会发出去的内容</h3>
+      <h3>① 发送前预览</h3>
       <p class="hint">
-        顺序固定为：预设模块 → 角色设定 → 世界书 → 历史消息。
-        发出去那一刻会存一份快照，之后再改历史消息也不会改写它。
+        按<strong>当前状态</strong>现算。顺序固定为：预设模块 → 角色设定 → 世界书 → 历史消息。
+        你一改消息、世界书或扫描深度，这里立刻跟着变。
       </p>
       <ol id="preview-sent" class="preview-list"></ol>
 
       <h3>没有发送的内容</h3>
-      <p class="hint">每一条都带原因，说明它为什么没进这次请求。</p>
+      <p class="hint">
+        每一条都写明原因：不发送 / 未完成 / 内容为空 /
+        世界书条目被禁用 / 世界书关键词未命中。
+      </p>
       <ul id="preview-notsent" class="preview-list notsent"></ul>
 
       <h3>上下文用量</h3>
@@ -96,6 +99,14 @@
       <button id="btn-clean-context" type="button" class="small">
         上下文快满了？批量处理较早的消息
       </button>
+
+      <h3>② 已发送的快照</h3>
+      <p class="hint">
+        这是<strong>发出去那一刻</strong>的记录，<strong>只读</strong>。
+        之后再改历史消息、改世界书、改深度，这里都不会变——
+        它回答的是「上次实际发的是什么」，跟上面的预览是两件事。
+      </p>
+      <div id="snapshot-list" class="snap-list"></div>
     </section>
 
     <!-- ---------- 世界书 ---------- -->

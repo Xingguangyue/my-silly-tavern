@@ -280,6 +280,20 @@ select { cursor: pointer; }
   padding: 2px 7px;
 }
 
+/* ④ 同时「隐藏」+「不发送」：以【不发送】为主 —— 它是更强的那个状态。
+   必须显式写这一条：不然 .is-hidden 的 dashed 边框会漏过来，
+   界面看起来像「按了没反应」。演示流程恰好是「先隐藏，再不发送」，
+   所以这个组合状态一定会被看到。 */
+.msg.is-hidden.is-excluded {
+  border-style: solid;
+  border-color: #7d3a31;
+  border-left: 4px solid var(--danger);
+}
+.msg.is-hidden.is-excluded .body { opacity: 1; }   /* 它不是「看不见」，是「不发」 */
+.msg.is-hidden.is-excluded::before {
+  content: "不发送（AI 读不到）· 同时也已隐藏";
+}
+
 /* ③ 已中断：刷新把没生成完的那条杀掉了 */
 .msg.is-interrupted { border-color: #6a5323; }
 .msg.is-interrupted::after {
@@ -378,6 +392,30 @@ select { cursor: pointer; }
 .usage-fill.is-warn { background: var(--warn); }
 .usage-fill.is-over { background: var(--danger); }
 .usage-text { margin: 6px 0 8px; font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+
+
+/* ---------------- 已发送的快照（只读列表） ---------------- */
+
+.snap-list { display: flex; flex-direction: column; gap: 6px; }
+
+.snap {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  background: #1b1716;
+  overflow: hidden;
+}
+.snap > summary {
+  cursor: pointer;
+  padding: 7px 10px;
+  font-size: 12px; color: var(--text-dim);
+  list-style: none;                 /* 去掉默认三角，换成下面自己画的 */
+}
+.snap > summary::-webkit-details-marker { display: none; }
+.snap > summary::before { content: "▸ "; color: var(--accent); }
+.snap[open] > summary::before { content: "▾ "; }
+.snap[open] > summary { color: var(--text); border-bottom: 1px solid var(--line); }
+.snap:hover > summary { background: var(--panel-2); }
+.snap .preview-list { padding: 9px 10px 4px 26px; }
 
 
 /* ---------------- 世界书 / 预设的条目卡片 ---------------- */

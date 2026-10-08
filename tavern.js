@@ -6,6 +6,10 @@ const DB = {
   presets: [],                  // 提示词预设（等级3）—— 一组提示词模块
   activePresetId: null,         // 当前在用哪个预设
   card: null,                   // 当前导入的角色卡（等级3），null = 还没有
+  // ⭐ 已发送的请求快照。题目第 986 行：「修改历史消息会影响后续请求，
+  //    但不能改写已经发出的请求快照。」所以这个数组只增不改 ——
+  //    全项目只有 generate() 里那一处会 push，别的地方一律不许动它。
+  snapshots: [],
   config: {
     apiBase: 'https://gcli.ggchan.dev/v1',  // OpenAI 兼容地址
     apiKey: '',
@@ -22,17 +26,40 @@ const DB = {
 let currentSessionId = null;  // 当前窗口的编号
 let showHidden = false;       // 「显示已隐藏」开关
 let inFlight = null;          // 正在生成的请求 {sid, msgId, controller}
-let lastPreview = null;       // 快照
 let mockRound = 0;            // 模拟回复的轮次（用来轮流演示正常/损坏的面板）
+// 注意：这里【没有】「当前预览」这种变量 —— 发送前预览是每次现算的（见 renderPreview），
+//       「已发送的快照」则存在 DB.snapshots 里只增不改。两者刻意分开，见题目第 986 行。
 
-// 存储模块
+/* 存储模块
+ *
+ * ⚠️ localStorage 不是永远可用：无痕模式、某些浏览器打开 file:// 时、
+ *    或者用户在浏览器设置里禁用了网站数据 —— 访问它都会【直接抛异常】。
+ *
+ * 而 save() 在 load() → createSession() 这条启动链上，一抛异常就是【整个页面白屏】。
+ * 别人的电脑上什么情况都有，所以这里必须兜住：
+ * 存不上最多是「刷新后数据没了」，但页面一定要能跑起来。
+ */
+let storageOK = true;
+
 function save() {
-  localStorage.setItem(STORE_KEY, JSON.stringify(DB)); //转成字符串然后DB传入localstorage
+  if (!storageOK) return;                 // 已经知道用不了，就别每次都抛一次
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(DB)); //转成字符串然后DB传入localstorage
+  } catch (e) {
+    storageOK = false;
+    console.warn('localStorage 用不了，改成只在内存里跑（刷新会丢数据）：', e && e.message);
+  }
 }
 
 // 加载模块
 function load() {
-  const raw = localStorage.getItem(STORE_KEY); //获取localstorage中的值
+  let raw = null;
+  try {
+    raw = localStorage.getItem(STORE_KEY); //获取localstorage中的值
+  } catch (e) {
+    storageOK = false;
+    console.warn('localStorage 用不了，从空数据开始跑：', e && e.message);
+  }
   if (raw) {
     try { //防崩溃
       const data = JSON.parse(raw); //翻译回json格式
@@ -44,6 +71,7 @@ function load() {
       DB.presets        = data.presets        || [];
       DB.activePresetId = data.activePresetId || null;
       DB.card           = data.card           || null;
+      DB.snapshots      = data.snapshots      || [];   // 已发送的快照，刷新也要留着
       // 新旧配置合并
       DB.config = Object.assign({}, DB.config, data.config || {});
     } catch (error) {
@@ -173,7 +201,7 @@ function toggleHidden(msgId) {
   m.hidden = !m.hidden;
   save();
   renderMessages();          // 勾了框才显示／不勾就消失，都靠这一句
-  refreshPreviewIfAny();     // 它在预览里的说明文字要跟着变
+  refreshPreview();     // 它在预览里的说明文字要跟着变
 }
 
 function toggleExcluded(msgId) {
@@ -181,7 +209,7 @@ function toggleExcluded(msgId) {
   m.excluded = !m.excluded;
   save();
   renderMessages();          // 红色边框 / 「不发送」标签要靠这一句
-  refreshPreviewIfAny();     // 它会从发送列表挪到「没有发送的内容」
+  refreshPreview();     // 它会从发送列表挪到「没有发送的内容」
 }
 
 function removeMessage(msgId) {
@@ -190,7 +218,7 @@ function removeMessage(msgId) {
   DB.messages[sid] = msgs(sid).filter(m => m.id !== msgId);
   save();
   renderAll();               // 消息数变了，左栏会话后面那个计数也要跟着变
-  refreshPreviewIfAny();
+  refreshPreview();
 }
 
 // 批量：把「最近 keep 条」之前的所有消息都设为不进上下文。
@@ -205,7 +233,7 @@ function batchExcludeOlder(keep) {
   }
   save();
   renderAll();
-  refreshPreviewIfAny();     // 先重画再弹提示，关掉提示时界面已经是新的了
+  refreshPreview();     // 先重画再弹提示，关掉提示时界面已经是新的了
   alert('已把 ' + n + ' 条较早的消息从上下文中移除');
 }
 
@@ -221,26 +249,39 @@ function isInContext(m) {
   return true;
 }
 
-// 未发送原因的枚举 —— 题目要求预览能回答「某条内容为什么没有发送」
+// 未发送原因的枚举。
+// 题目第 24 页要求预览能回答「某条内容为什么没有发送：
+// 禁用、未命中、未完成、关闭上下文，还是什么别的原因」——
+// 注意「禁用」和「未命中」说的是【世界书条目】，不只是消息，所以下面五条都要有。
 const REASON_TEXT = {
-  excluded:   '已被设为「不发送」',
-  incomplete: '生成未完成',
-  empty:      '内容为空'
+  excluded:    '已被设为「不发送」',
+  incomplete:  '生成未完成',
+  empty:       '内容为空',
+  wb_disabled: '世界书条目已禁用：始终排除',
+  wb_nomatch:  '关键词未命中：没出现在被扫描的那几条消息里'
 };
 
 /**
  * 构造这次请求要发的内容，同时生成一份「请求快照」。
- * 快照是发出去那一刻的事实，之后改历史消息也不会改写它。
+ *
+ * 注意「快照」和「预览」是两个东西：
+ *   · 这个函数返回的 snapshot 是【发出去那一刻】的事实，
+ *     由 generate() 存进 DB.snapshots 之后就不再改写；
+ *   · 界面上那个「发送前预览」是每次现算的，所以会随着你改消息而变化。
+ * 题目第 986 行明写「修改历史消息会影响后续请求，但不能改写已经发出的请求快照」。
  */
 function buildRequest(sid, extraText) {
   const list = msgs(sid);
   const sent = [];      // 会被发送的消息
-  const notSent = [];   // 不会被发送的消息 + 原因
+  const notSent = [];   // 不会被发送的内容 + 原因
+
+  // 统一的显示名：消息写「用户消息 · 3_x8k」，世界书条目写「世界书条目：柳洞寺」
+  const msgLabel = (m) => (m.role === 'user' ? '用户消息' : 'AI 消息') + ' · ' + m.id.slice(-6);
 
   for (const m of list) {
-    if (m.excluded)   { notSent.push({ id: m.id, role: m.role, reason: 'excluded' });   continue; }
-    if (!m.complete)  { notSent.push({ id: m.id, role: m.role, reason: 'incomplete' }); continue; }
-    if (!m.content)   { notSent.push({ id: m.id, role: m.role, reason: 'empty' });      continue; }
+    if (m.excluded)   { notSent.push({ id: m.id, reason: 'excluded',   label: msgLabel(m) }); continue; }
+    if (!m.complete)  { notSent.push({ id: m.id, reason: 'incomplete', label: msgLabel(m) }); continue; }
+    if (!m.content)   { notSent.push({ id: m.id, reason: 'empty',      label: msgLabel(m) }); continue; }
     sent.push({ id: m.id, role: m.role, content: m.content, hidden: !!m.hidden });
   }
 
@@ -248,6 +289,19 @@ function buildRequest(sid, extraText) {
   // 注意：matchWorldbook 只扫消息正文，所以下面第 ①② 段（预设、角色设定）
   //      不会被卷进关键词匹配 —— 这正是世界书规则 4「不递归扫描」的要求。
   const hits = matchWorldbook(sid, extraText);
+
+  // ⭐ 没被选中的世界书条目也要给出原因。
+  //    题目举的例子是「禁用、未命中、未完成、关闭上下文」——
+  //    前两个说的就是这里。没有这一段，预览就只能回答消息为什么没发。
+  const hitIds = new Set(hits.map(h => h.entry.id));
+  for (const e of DB.worldbook.entries) {
+    if (hitIds.has(e.id)) continue;      // 进了 hits 的会在「发送列表」里出现，不在这里重复
+    notSent.push({
+      id: e.id,
+      reason: e.enabled ? 'wb_nomatch' : 'wb_disabled',
+      label: '世界书条目：' + e.name
+    });
+  }
 
   /* ---------------------------------------------------------------
    * ⭐ 等级 3：请求内容的顺序 = ① 预设 → ② 角色设定 → ③ 世界书 → ④ 历史消息
@@ -389,11 +443,15 @@ function estimateTokens(messages) {
   let total = 0;
   for (const m of messages) {
     const t = m.content || '';
-    //这里直接让AI写的看不懂。。
-    //中文字符约 1 token，其余约4字符1token。
+
+    // 估算规则（只是估算，不是真的分词器）：
+    //   · 汉字和全角标点 → 大约 1 个字符算 1 个 token
+    //   · 其余（英文、数字、半角符号）→ 大约 4 个字符算 1 个 token
+    //   · 每条消息再固定加 4，当作 role、角色名这些固定开销
+    // 正则三段分别是：\u4e00-\u9fff 汉字、\u3000-\u303f 日式标点、\uff00-\uffef 全角字符
     const cjk = (t.match(/[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/g) || []).length;
     total += cjk + Math.ceil((t.length - cjk) / 4) + 4;
-  } 
+  }
   return total;
 }
 
@@ -415,9 +473,11 @@ async function streamChat(messages, onDelta, signal) {
       '总共 ' + messages.length + ' 条内容会发给模型。\n\n';
 
     // ① 状态面板：模拟模型按「预设里的格式说明」输出
+    //    ⚠️ location 故意用一个不含关键词的地名。如果这里写「柳洞寺」，
+    //       它就会落进消息正文、被世界书扫到，演示「扫描深度」时会看不出变化。
     const hp = Math.max(1, 20 - (mockRound % 4) * 3);
     text += '<tavern-panel type="status">\n' +
-      '{"hp":' + hp + ',"hpMax":20,"令咒":3,"location":"柳洞寺","回合":' + mockRound + '}\n' +
+      '{"hp":' + hp + ',"hpMax":20,"令咒":3,"location":"未名之地","回合":' + mockRound + '}\n' +
       '</tavern-panel>\n\n';
 
     // ② 选项面板
@@ -554,9 +614,19 @@ async function sendMessage() {
 async function generate(sid) {
   const { finalMessages, snapshot } = buildRequest(sid);
 
-  // 先把快照存下来（这就是「请求快照」：发出去那一刻发了什么，之后不再变）
-  lastPreview = snapshot;
-  renderPreview();
+  /* ⭐ 发送后的请求快照 —— 全项目唯一往 DB.snapshots 里写的地方。
+   *
+   * 题目第 986 行：「修改历史消息会影响后续请求，但不能改写已经发出的请求快照。」
+   * 所以：这里 push 进去之后，任何地方都不许再改它。
+   * 你在界面上改消息状态、改世界书，动的只是「发送前预览」，
+   * 这个数组纹丝不动 —— 这就是两个东西必须分开的原因。
+   */
+  DB.snapshots.push(snapshot);
+  // 每条快照都带着完整的上下文正文，所以它会随对话变长而变胖。
+  // 只留最近 12 条，避免把 localStorage 撑爆（这是取舍，不是最优解）。
+  if (DB.snapshots.length > 12) DB.snapshots = DB.snapshots.slice(-12);
+  save();
+  renderPreview();     // 预览重算 + 快照列表多一条
 
   // 建一条占位的消息
   const reply = {
@@ -655,6 +725,11 @@ function renderSessions() {
 function renderMessages() {
   const box = $('#message-list');
   box.textContent = '';
+
+  // ⭐ 顺带刷左栏的会话列表。听起来多余，其实是为了「不可能漏」：
+  //    发消息 / 删消息 / 重新生成改的都是消息条数，左栏那个数字也要跟着变。
+  //    如果只在 renderAll() 里刷，聊天时那个数字就会一直是旧的。
+  renderSessions();
 
   const list = msgs(currentSessionId);
   for (const m of list) {
@@ -855,7 +930,10 @@ function buildProblem(reason, rawText) {
   return box;
 }
 
-// 约定：如果数据里同时有 hp 和 hpMax，就画一条血条；其余字段按 键 → 值 展示
+// 画进度条的约定：任意「X」和「XMax」成对出现就画一条。
+// 这样 hp/hpMax 固然能画，模型自己发挥出来的 durability/durabilityMax、
+// 耐久/耐久Max 也一样能画 —— 模型不一定严格按预设的格式来，界面对此要稳。
+// 配不成对的字段就全部按 键 → 值 展示。
 function buildStatusPanel(data) {
   const card = document.createElement('div');
   card.className = 'tpanel';
@@ -868,26 +946,37 @@ function buildStatusPanel(data) {
   const grid = document.createElement('div');
   grid.className = 'tp-grid';
 
-  const hp = Number(data.hp);
-  const hpMax = Number(data.hpMax);
-  if (!isNaN(hp) && !isNaN(hpMax) && hpMax > 0) {
+  const drawn = {};   // 已经画成条的字段，下面不再重复列一行
+
+  for (const maxKey of Object.keys(data)) {
+    if (!/Max$/.test(maxKey)) continue;
+    const baseKey = maxKey.slice(0, -3);
+    if (!Object.prototype.hasOwnProperty.call(data, baseKey)) continue;
+
+    const cur = Number(data[baseKey]);
+    const max = Number(data[maxKey]);
+    if (isNaN(cur) || isNaN(max) || max <= 0) continue;
+
+    drawn[baseKey] = true;
+    drawn[maxKey] = true;
+
     const bar = document.createElement('div');
     bar.className = 'hp-bar';
     const fill = document.createElement('div');
     fill.className = 'hp-fill';
-    fill.style.width = Math.max(0, Math.min(100, (hp / hpMax) * 100)) + '%';
+    fill.style.width = Math.max(0, Math.min(100, (cur / max) * 100)) + '%';
     bar.appendChild(fill);
 
     const lbl = document.createElement('div');
     lbl.className = 'hp-label';
-    lbl.textContent = 'HP ' + hp + ' / ' + hpMax;
+    lbl.textContent = String(baseKey).toUpperCase() + ' ' + cur + ' / ' + max;
 
     grid.appendChild(lbl);
     grid.appendChild(bar);
   }
 
   for (const key of Object.keys(data)) {
-    if (key === 'hpMax') continue;
+    if (drawn[key]) continue;
     const cell = document.createElement('div');
     cell.className = 'tp-cell';
     const k = document.createElement('span');
@@ -976,7 +1065,7 @@ function renderWorldbook() {
     delBtn.textContent = '删';
     delBtn.addEventListener('click', () => {
       DB.worldbook.entries = DB.worldbook.entries.filter(x => x.id !== e.id);
-      save(); renderWorldbook(); refreshPreviewIfAny();
+      save(); renderWorldbook(); refreshPreview();
     });
     row1.appendChild(idLbl); row1.appendChild(nameIn); row1.appendChild(delBtn);
 
@@ -1017,7 +1106,7 @@ function renderWorldbook() {
     chkOn.type = 'checkbox';
     chkOn.checked = e.enabled;
     chkOn.addEventListener('change', () => {
-      e.enabled = chkOn.checked; save(); renderWorldbook(); refreshPreviewIfAny();
+      e.enabled = chkOn.checked; save(); renderWorldbook(); refreshPreview();
     });
     const spOn = document.createElement('span');
     spOn.textContent = '启用';
@@ -1029,7 +1118,7 @@ function renderWorldbook() {
     chkConst.type = 'checkbox';
     chkConst.checked = e.constant;
     chkConst.addEventListener('change', () => {
-      e.constant = chkConst.checked; save(); refreshPreviewIfAny();
+      e.constant = chkConst.checked; save(); refreshPreview();
     });
     const spConst = document.createElement('span');
     spConst.textContent = '常驻';
@@ -1047,7 +1136,7 @@ function renderWorldbook() {
     prioIn.value = e.priority;
     prioIn.setAttribute('aria-label', '优先级');
     prioIn.addEventListener('input', () => {
-      e.priority = Number(prioIn.value) || 0; save(); refreshPreviewIfAny();
+      e.priority = Number(prioIn.value) || 0; save(); refreshPreview();
     });
     prioWrap.appendChild(prioLbl); prioWrap.appendChild(prioIn);
 
@@ -1060,19 +1149,30 @@ function renderWorldbook() {
   $('#cfg-depth-wb').value = DB.config.depth;
 }
 
+/* ============================================================
+ * 发送前预览 vs 已发送快照 —— 这是两个东西，故意分开
+ *
+ * 题目第 986 行：「修改历史消息会影响后续请求，但不能改写已经发出的请求快照。」
+ * 题目第 1004 行：「提供发送前预览，并保存发送后的请求快照。」
+ *
+ *   · 发送前预览（本函数上半部分）—— 每次现算。你改消息、改世界书、改深度，
+ *     它立刻跟着变。它回答「我如果现在发出去，会发什么」。
+ *   · 已发送快照（renderSnapshots）—— 发出去那一刻存进 DB.snapshots 之后
+ *     就【只读】。它回答「上次实际发的是什么」。改历史不会动它。
+ *
+ * 如果只用一个变量在两种含义之间来回覆盖，就会踩题目的红线。所以这里刻意不省。
+ * ============================================================ */
+
 function renderPreview() {
   const olSent = $('#preview-sent');
   const ulNot = $('#preview-notsent');
   olSent.textContent = '';
   ulNot.textContent = '';
 
-  if (!lastPreview) {
-    $('#usage-text').textContent = '还没发送过请求';
-    $('#usage-fill').style.width = '0%';
-    return;
-  }
+  const fill = $('#usage-fill');
 
-  const p = lastPreview;
+  // 现算一份「如果现在发出去」的内容
+  const { snapshot: p } = buildRequest(currentSessionId, null);
 
   // 「将按此顺序发送」
   p.parts.forEach((part, i) => {
@@ -1100,14 +1200,15 @@ function renderPreview() {
     olSent.appendChild(li);
   }
 
-  // 「没有发送的内容」+ 原因 —— 这一段是题目明写的检查项
+  // 「没有发送的内容」+ 原因 —— 这一段是题目明写的检查项。
+  // 既包括消息（不发送 / 未完成 / 空），也包括世界书条目（禁用 / 未命中）。
   p.notSent.forEach(ns => {
     const li = document.createElement('li');
     const tag = document.createElement('span');
     tag.className = 'reason-tag';
     tag.textContent = REASON_TEXT[ns.reason] || ns.reason;
     const who = document.createElement('span');
-    who.textContent = (ns.role === 'user' ? '用户消息' : 'AI 消息') + ' · ' + ns.id.slice(-6);
+    who.textContent = ns.label || ((ns.role === 'user' ? '用户消息' : 'AI 消息') + ' · ' + ns.id.slice(-6));
     li.appendChild(tag); li.appendChild(who);
     ulNot.appendChild(li);
   });
@@ -1120,7 +1221,6 @@ function renderPreview() {
 
   // 用量 + 「快满了」提醒（题目要求 80% 时提醒，并给出可处理的消息入口）
   const ratio = Math.min(1.5, p.usage / p.limit);
-  const fill = $('#usage-fill');
   fill.style.width = Math.min(100, ratio * 100) + '%';
   fill.className = ratio >= 1 ? 'is-over' : (ratio >= 0.8 ? 'is-warn' : '');
 
@@ -1129,6 +1229,65 @@ function renderPreview() {
   if (ratio >= 1) txt += '\n⚠️ 已经超过上限了！';
   else if (ratio >= 0.8) txt += '\n⚠️ 上下文快满了，可以排除较早的消息。';
   $('#usage-text').textContent = txt;
+
+  // 底下那个只读的「已发送快照」列表
+  renderSnapshots();
+}
+
+/**
+ * 已发送的请求快照列表 —— 只读。
+ * 数据来自 DB.snapshots，只有 generate() 会往里写，别的地方一律不改它。
+ * 这就是题目说的「保存发送后的请求快照」，也是能被追问的底气：
+ * 你改历史消息，这个列表纹丝不动。
+ */
+function renderSnapshots() {
+  const box = $('#snapshot-list');
+  if (!box) return;
+  box.textContent = '';
+
+  const mine = DB.snapshots.filter(s => s.sessionId === currentSessionId);
+  if (!mine.length) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = '这个会话还没发送过请求。发一条之后，这里会存下那一刻实际发出去的内容——' +
+                    '之后你再改历史消息，它也不会变。';
+    box.appendChild(p);
+    return;
+  }
+
+  // 新的排在上面
+  for (let i = mine.length - 1; i >= 0; i--) {
+    const s = mine[i];
+    const d = document.createElement('details');
+    d.className = 'snap';
+
+    const t = new Date(s.createdAt);
+    const two = (n) => String(n).padStart(2, '0');
+    const sum = document.createElement('summary');
+    sum.textContent = '快照 #' + (i + 1) + ' · ' +
+                      two(t.getHours()) + ':' + two(t.getMinutes()) + ':' + two(t.getSeconds()) +
+                      ' · ' + s.parts.length + ' 段 · 约 ' + s.usage + ' token';
+    d.appendChild(sum);
+
+    const ol = document.createElement('ol');
+    ol.className = 'preview-list';
+    s.parts.forEach((part, k) => {
+      const li = document.createElement('li');
+      const src = document.createElement('span');
+      src.className = 'src';
+      src.textContent = (k + 1) + '. ' + part.label;
+      const why = document.createElement('span');
+      why.className = 'why';
+      why.textContent = part.which;
+      const txt = document.createElement('span');
+      txt.className = 'txt';
+      txt.textContent = part.content;
+      li.appendChild(src); li.appendChild(why); li.appendChild(txt);
+      ol.appendChild(li);
+    });
+    d.appendChild(ol);
+    box.appendChild(d);
+  }
 }
 
 function renderConfig() {
@@ -1154,10 +1313,7 @@ function scrollToBottom() {
 }
 
 // 改了消息状态或世界书之后，如果已经有快照了，重算一遍让预览跟着变
-function refreshPreviewIfAny() {
-  if (!lastPreview) return;
-  const { snapshot } = buildRequest(currentSessionId, null);
-  lastPreview = snapshot;
+function refreshPreview() {
   renderPreview();
 }
 
@@ -1281,12 +1437,12 @@ function bindEvents() {
       constant: false,
       priority: 10
     });
-    save(); renderWorldbook(); refreshPreviewIfAny();
+    save(); renderWorldbook(); refreshPreview();
   });
 
   $('#cfg-depth-wb').addEventListener('input', (e) => {
     DB.config.depth = Math.max(0, Number(e.target.value) || 0);
-    save(); refreshPreviewIfAny();
+    save(); refreshPreview();
   });
 
   // 设置
