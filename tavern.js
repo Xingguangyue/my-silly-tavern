@@ -532,16 +532,37 @@ async function streamChat(messages, onDelta, signal) {
   };
   if (cfg.proxy) headers['X-Upstream-Base'] = base;   // 告诉代理要转发到哪
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify({
-      model: cfg.model,
-      messages: messages,
-      stream: !!cfg.stream
-    }),
-    signal: signal
-  });
+  // ⚠️ 请求"根本没发出去"的时候（网络不通 / 本地代理没在跑 / 被 CORS 拦掉），
+  //    浏览器只会丢一句 "Failed to fetch"，从这句话看不出到底是哪一种。
+  //    所以在这里分开翻译成人话，否则界面上一句 Failed to fetch 谁都不知道怎么办。
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: messages,
+        stream: !!cfg.stream
+      }),
+      signal: signal
+    });
+  } catch (e) {
+    // ⭐ 用户点了「中止」也是从 fetch 抛出来的，必须原样往上抛。
+    //    上层靠 e.name === 'AbortError' 判断"这是用户中断"，包成别的错误就分不出来了。
+    if (e && e.name === 'AbortError') throw e;
+
+    const raw = (e && e.message) || String(e);
+    if (cfg.proxy) {
+      throw new Error('连不上本地代理。检查两件事：serve.py 是不是正在运行'
+        + '（python serve.py），以及页面是不是从 http://localhost:8000 打开的？'
+        + '（原始错误：' + raw + '）');
+    }
+    throw new Error('请求没能发出去。常见原因：网络不通，或者模型服务不允许跨域(CORS)。'
+      + '如果确认是跨域问题，可以起本地代理绕过：python serve.py，'
+      + '然后在设置里勾上「走本地代理 serve.py」。'
+      + '（原始错误：' + raw + '）');
+  }
 
   if (!res.ok) {
     const body = await res.text();
