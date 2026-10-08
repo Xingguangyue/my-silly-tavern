@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>我的酒馆 · My Tavern</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- 键盘用户跳转用；平时看不见 -->
+<a class="skip-link" href="#input">跳到输入框</a>
+
+<header class="app-head">
+  <h1>我的酒馆</h1>
+  <p class="sub">能自己讲清「这一次到底把什么内容、按什么顺序发给了模型」的角色扮演前端</p>
+</header>
+
+<div class="layout">
+
+  <!-- ================= 左栏：会话 ================= -->
+  <aside class="col col-left" aria-label="会话列表">
+    <div class="col-head">
+      <h2>会话</h2>
+      <button id="btn-new-session" type="button" class="small">＋ 新建</button>
+    </div>
+
+    <ul id="session-list" class="session-list"></ul>
+
+    <div class="col-foot">
+      <button id="btn-export" type="button" class="small">导出会话</button>
+      <button id="btn-import" type="button" class="small">导入会话</button>
+      <!-- 真正的文件选择框藏着，由按钮点它 -->
+      <input id="file-import" type="file" accept=".json,application/json" hidden>
+    </div>
+  </aside>
+
+  <!-- ================= 中栏：对话 ================= -->
+  <main class="col col-mid">
+    <div class="chat-head">
+      <h2 id="session-title">（没有会话）</h2>
+      <div class="chat-head-actions">
+        <label class="switch">
+          <input id="chk-show-hidden" type="checkbox">
+          <span>显示已隐藏</span>
+        </label>
+        <button id="btn-rename" type="button" class="small">重命名</button>
+        <button id="btn-delete-session" type="button" class="small danger">删除会话</button>
+      </div>
+    </div>
+
+    <!-- role=log + aria-live：新增消息会被读屏软件念出来 -->
+    <div id="message-list" class="message-list"
+         role="log" aria-live="polite" aria-relevant="additions text"></div>
+
+    <div class="composer">
+      <label for="input" class="sr-only">输入消息</label>
+      <textarea id="input" rows="3" placeholder="输入消息…（Ctrl + Enter 发送）"></textarea>
+      <div class="composer-actions">
+        <button id="btn-send" type="button" class="primary">发送</button>
+        <button id="btn-stop" type="button" class="danger" hidden>中止</button>
+        <button id="btn-retry" type="button">重新生成</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ================= 右栏：预览 / 世界书 / 预设 / 角色卡 / 设置 ================= -->
+  <aside class="col col-right" aria-label="请求预览与配置">
+
+    <div class="tabs" role="tablist">
+      <button class="tab is-active" type="button" data-tab="preview"  role="tab">预览</button>
+      <button class="tab"           type="button" data-tab="worldbook" role="tab">世界书</button>
+      <button class="tab"           type="button" data-tab="presets"  role="tab">预设</button>
+      <button class="tab"           type="button" data-tab="card"     role="tab">角色卡</button>
+      <button class="tab"           type="button" data-tab="settings" role="tab">设置</button>
+    </div>
+
+    <!-- ---------- 预览 ---------- -->
+    <section class="tab-pane is-active" data-pane="preview" aria-label="请求预览">
+      <h3>这次实际会发出去的内容</h3>
+      <p class="hint">
+        顺序固定为：预设模块 → 角色设定 → 世界书 → 历史消息。
+        发出去那一刻会存一份快照，之后再改历史消息也不会改写它。
+      </p>
+      <ol id="preview-sent" class="preview-list"></ol>
+
+      <h3>没有发送的内容</h3>
+      <p class="hint">每一条都带原因，说明它为什么没进这次请求。</p>
+      <ul id="preview-notsent" class="preview-list notsent"></ul>
+
+      <h3>上下文用量</h3>
+      <div class="usage-bar">
+        <div id="usage-fill" class="usage-fill"></div>
+      </div>
+      <p id="usage-text" class="usage-text">还没发送过请求</p>
+      <button id="btn-clean-context" type="button" class="small">
+        上下文快满了？批量处理较早的消息
+      </button>
+    </section>
+
+    <!-- ---------- 世界书 ---------- -->
+    <section class="tab-pane" data-pane="worldbook" aria-label="世界书">
+      <div class="pane-head">
+        <h3>世界书</h3>
+        <button id="btn-add-entry" type="button" class="small">＋ 新增</button>
+      </div>
+
+      <label class="field" for="cfg-depth-wb">
+        <span class="mini-label">扫描深度 N（只看最近 N 条消息 + 本次待发送的那条）</span>
+      </label>
+      <input id="cfg-depth-wb" type="number" min="0" step="1">
+
+      <p class="hint">
+        匹配规则：单条消息内做子串包含，<strong>不跨消息拼接</strong>；
+        禁用的条目永远排除，常驻的条目直接入选；
+        同一优先级下按 ASCII ID 升序，每个条目最多插入一次。
+      </p>
+
+      <div id="worldbook-list" class="wb-list"></div>
+    </section>
+
+    <!-- ---------- 预设 ---------- -->
+    <section class="tab-pane" data-pane="presets" aria-label="提示词预设">
+      <h3>提示词预设</h3>
+
+      <label class="field" for="cfg-active-preset">
+        <span class="mini-label">当前使用的预设</span>
+      </label>
+      <select id="cfg-active-preset"></select>
+
+      <div class="row">
+        <button id="btn-add-module" type="button" class="small">＋ 模块</button>
+        <button id="btn-export-preset" type="button" class="small">导出预设</button>
+        <button id="btn-import-preset" type="button" class="small">导入预设</button>
+        <input id="file-preset" type="file" accept=".json,application/json" hidden>
+      </div>
+
+      <p class="hint">
+        启用的模块按「顺序」从小到大拼在请求最前面。
+        只要导入的 JSON 符合本应用的格式，<strong>不用改一行业务代码</strong>就能直接用。
+      </p>
+
+      <div id="module-list" class="wb-list"></div>
+    </section>
+
+    <!-- ---------- 角色卡 ---------- -->
+    <section class="tab-pane" data-pane="card" aria-label="角色卡">
+      <div class="pane-head">
+        <h3>角色卡（Character Card V2 子集）</h3>
+      </div>
+
+      <div class="row">
+        <button id="btn-import-card" type="button" class="small">导入（JSON / PNG）</button>
+        <button id="btn-export-card" type="button" class="small">导出</button>
+        <input id="file-card" type="file"
+               accept=".json,.png,application/json,image/png" hidden>
+      </div>
+
+      <p class="hint">
+        只实现一个<strong>明确子集</strong>：名称 / 描述 / 开场白 / 内嵌世界书。
+        不认识的字段和未知 extensions <strong>全部原样保留</strong>，导出时写回去。
+      </p>
+
+      <div id="card-info" class="tp-grid"></div>
+
+      <h4>字段映射（角色卡 → 本应用）</h4>
+      <div id="card-map" class="map-table"></div>
+
+      <h4>被忽略的运行规则（如实说明兼容范围）</h4>
+      <div id="card-ignored" class="map-table"></div>
+    </section>
+
+    <!-- ---------- 设置 ---------- -->
+    <section class="tab-pane" data-pane="settings" aria-label="设置">
+      <h3>设置</h3>
+
+      <label class="field" for="cfg-apiBase"><span class="mini-label">API 地址（OpenAI 兼容）</span></label>
+      <input id="cfg-apiBase" type="text" placeholder="https://example.com/v1">
+
+      <label class="field" for="cfg-apiKey"><span class="mini-label">API Key</span></label>
+      <input id="cfg-apiKey" type="password" placeholder="sk-…">
+
+      <label class="field" for="cfg-model"><span class="mini-label">模型名</span></label>
+      <input id="cfg-model" type="text">
+
+      <label class="field" for="cfg-ctxLimit"><span class="mini-label">上下文上限（估算 token）</span></label>
+      <input id="cfg-ctxLimit" type="number" min="500" step="500">
+
+      <label class="switch">
+        <input id="cfg-stream" type="checkbox">
+        <span>流式输出</span>
+      </label>
+
+      <label class="switch">
+        <input id="cfg-mock" type="checkbox">
+        <span>模拟回复（不联网，也能演示世界书和面板）</span>
+      </label>
+
+      <label class="switch">
+        <input id="cfg-proxy" type="checkbox">
+        <span>走本地代理 serve.py（被 CORS 拦住时勾上）</span>
+      </label>
+
+      <button id="btn-save-config" type="button" class="primary">保存设置</button>
+    </section>
+
+  </aside>
+</div>
+
+<!-- ⚠️ 必须放在最后：tavern.js 末尾会立刻调用 init()，
+     它要求此时所有 DOM 元素都已经存在。 -->
+<script src="tavern.js"></script>
+</body>
+</html>
